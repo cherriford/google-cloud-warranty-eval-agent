@@ -123,4 +123,4 @@ gcloud run deploy warranty-portal \
 
 After the app is deployed, navigate to the Service URL. The site should resemble the following
 
-img src="./images/warranty-portal-ui.png" width="400">
+<img src="./images/warranty-portal-ui.png" width="400">
