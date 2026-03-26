@@ -144,7 +144,7 @@ gcloud pubsub subscriptions create warranty-claims-sub \
     - Issue: The battery no longer holds a charge.
 1. Click Submit Claim. You should see a success message on the site.
 
-## 3. Pull the Message from the Terminal
+## 3. Pull and Decode the Message
 
 Now, let's see if the message actually made it to the subscription. We'll pull the message and look at the data.
 
@@ -155,4 +155,15 @@ gcloud pubsub subscriptions pull warranty-claims-sub \
     --format="json"
 ```
 
-You should see a JSON output containing the `data` field. The data is base64 encoded by default, but the gcloud command usually decodes it in the output. It should resemble the following: `{"event": "claim_submitted", "customer_id": "C-552", ...}`
+To verify the data:
+
+1. In the output, locate the "data" field (it will look like a long string of random characters e.g., `"data": "eyJldmVudCI6..."`).
+1. Copy the string
+1. Run the following command, replacing `PASTE_DATA_HERE` with your string:
+
+```bash
+echo "PASTE_DATA_HERE" | base64 --decode
+```
+You should see the original JSON payload:
+
+<img src="./images/decoded-message.png" width="500">
