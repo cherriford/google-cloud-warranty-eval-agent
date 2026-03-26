@@ -33,6 +33,11 @@ gcloud services enable \
     iam.googleapis.com \
     binaryauthorization.googleapis.com \
     storage.googleapis.com \
+    logging.googleapis.com \
+    monitoring.googleapis.com \
+    clouderrorreporting.googleapis.com \
+    cloudtrace.googleapis.com \
+    cloudresourcemanager.googleapis.com \
     --project="APP_PROJECT_ID"
 ```
 
@@ -192,9 +197,17 @@ gcloud artifacts repositories create agent-registry \
 
 # 2. Enable Automatic Vulnerability Scanning
 gcloud services enable containerscanning.googleapis.com --project=$IMAGE_PROJECT
+
+# 3. Create the Staging Bucket
+gcloud storage buckets create gs://$BUCKET_NAME --project=$APP_PROJECT --location=$REGION
 ```
 
-## 2. Define Logic for Agent 1
+## 2. Provision the Agent Identity
+
+In order to set up IAM policies before deploying our agent, we need to create an agent identity without deploying agent code. To do so, we create an Agent Engine instance with just the `identity_type` field per [our documentation](https://docs.cloud.google.com/agent-builder/agent-engine/agent-identity#create-agent-identity). 
+
+
+
 
 Agent 1 acts as a Reasoning Engine. In Vertex AI, this is typically implemented using a Python-based framework that defines how the agent thinks and which tools it calls.
 
