@@ -166,4 +166,4 @@ echo "PASTE_DATA_HERE" | base64 --decode
 ```
 You should see the original JSON payload:
 
-<img src="./images/decoded-message.png" width="500">
+<img src="./images/decoded-message.png" width="900">
