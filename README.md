@@ -5,17 +5,117 @@ Event-driven, multi-agent system built on Google Cloud for Agentic Security, Saf
 
 This project implements an agentic chain triggered by customer events. It is designed with a **zero-trust** security model in mind, ensuring that the public-facing orchestrator has minimal permissions.
 
-1.  **Trigger**: A Cloud Pub/Sub message is published when a customer submits a claim form.
-2.  **Orchestrator (Agent 1: Case Manager)**: 
-    *   Hosted on **Vertex AI Agent Engine**.
-    *   Categorizes issues and coordinates the "Entitlement" check.
-    *   Operates in a Zero-Trust boundary with restricted IAM roles.
-3.  **Specialized Agents**: 
-    *   **Agent 2 (Entitlement Guardian)**: Verifies purchase history and warranty status.
-    *   **Agent 3 (Logistics Liaison)**: Generates shipping labels or discount codes.
-4.  **Storage**: Interaction summaries are persisted to **Cloud Firestore** for audit and human-in-the-loop review.
-
 ## Prerequisites
-* Google Cloud Project with Billing enabled.
-* gcloud CLI installed and authenticated.
-* Vertex AI and Pub/Sub APIs enabled.
+
+Before beginning the deployment, ensure the following requirements are met:
+
+* Two distinct Google Cloud Projects: You must have Owner or Editor access to an "Image" project and an "App" project.
+* Billing Enabled: Active billing accounts must be linked to both projects.
+* Google Cloud CLI: Ensure gcloud is installed and authenticated (gcloud auth login).
+
+### Enable Required APIs
+Run the following commands to turn on the necessary services in each project.
+
+For the Image Project:
+
+```bash
+gcloud services enable \
+    cloudbuild.googleapis.com \
+    artifactregistry.googleapis.com \
+    --project="IMAGE_PROJECT_ID"
+```
+
+For the App Project:
+
+```bash
+# Replace 'your-app-project-id' with your actual project ID before running
+gcloud services enable \
+    run.googleapis.com \
+    pubsub.googleapis.com \
+    iam.googleapis.com \
+    --project="APP_PROJECT_ID"
+```
+
+# Deploy Customer Warranty Portal
+
+## 1. Set Environment Variables
+
+Update the IMAGE_PROJECT and APP_PROJECT variables with your actual project IDs before running this block.
+
+```bash
+# Define Project IDs
+export IMAGE_PROJECT="IMAGE_PROJECT_ID"
+export APP_PROJECT="APP_PROJECT_ID" # <-- REPLACE THIS
+
+# Define Resource Names
+export REGION="us-central1"
+export REPO_NAME="warranty-portal-repo"
+export IMAGE_NAME="portal-app:v1"
+export TOPIC_NAME="warranty-claims"
+export SA_NAME="portal-identity"
+
+# Dynamically fetch the App Project Number for IAM bindings
+export APP_PROJECT_NUMBER=$(gcloud projects describe $APP_PROJECT --format="value(projectNumber)")
+```
+
+## 2. Build and Push the Container Image
+
+Build the container from your local source code and push it to the central Image Project. Run this from the directory containing the Dockerfile and app.py from the customer-portal directory in this repo.
+
+```bash
+gcloud builds submit \
+    --project=$IMAGE_PROJECT \
+    --tag=${REGION}-docker.pkg.dev/${IMAGE_PROJECT}/${REPO_NAME}/${IMAGE_NAME}
+```
+
+## 3. Configure Cross-Project Access
+
+Grant the Cloud Run Service Agent in the App Project permission to pull the container image from the Image Project.
+
+```bash
+gcloud artifacts repositories add-iam-policy-binding $REPO_NAME \
+    --project=$IMAGE_PROJECT \
+    --location=$REGION \
+    --member="serviceAccount:service-${APP_PROJECT_NUMBER}@serverless-robot-prod.iam.gserviceaccount.com" \
+    --role="roles/artifactregistry.reader"
+```
+
+## 4. Set Up Pub/Sub
+
+Create the destination topic in the App Project where the portal will publish incoming JSON claims.
+
+```bash
+gcloud pubsub topics create $TOPIC_NAME \
+    --project=$APP_PROJECT
+```
+
+## 5. Create the Service Identity
+
+Create a dedicated Service Account for the Cloud Run application and grant it permission to publish messages to the Pub/Sub topic.
+
+```bash
+# Create the Service Account
+gcloud iam service-accounts create $SA_NAME \
+    --project=$APP_PROJECT \
+    --display-name="Customer Portal Service Account"
+
+# Grant the Pub/Sub Publisher role
+gcloud pubsub topics add-iam-policy-binding $TOPIC_NAME \
+    --project=$APP_PROJECT \
+    --member="serviceAccount:${SA_NAME}@${APP_PROJECT}.iam.gserviceaccount.com" \
+    --role="roles/pubsub.publisher"
+```
+
+## 6. Deploy to Cloud Run
+
+Deploy the service using the cross-project image, attach the dedicated service account, and open it to public traffic.
+
+```bash
+gcloud run deploy warranty-portal \
+    --project=$APP_PROJECT \
+    --image=${REGION}-docker.pkg.dev/${IMAGE_PROJECT}/${REPO_NAME}/${IMAGE_NAME} \
+    --region=$REGION \
+    --allow-unauthenticated \
+    --service-account=${SA_NAME}@${APP_PROJECT}.iam.gserviceaccount.com \
+    --set-env-vars=PUBSUB_TOPIC=$TOPIC_NAME,GOOGLE_CLOUD_PROJECT=$APP_PROJECT
+```
