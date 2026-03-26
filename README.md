@@ -41,7 +41,7 @@ gcloud services enable \
 
 ## 1. Set Environment Variables
 
-Update the IMAGE_PROJECT and APP_PROJECT variables with your actual project IDs before running this block.
+Configure your terminal session with your specific project details.
 
 ```bash
 # Define Project IDs
