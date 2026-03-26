@@ -120,3 +120,7 @@ gcloud run deploy warranty-portal \
     --service-account=${SA_NAME}@${APP_PROJECT}.iam.gserviceaccount.com \
     --set-env-vars=PUBSUB_TOPIC=$TOPIC_NAME,GOOGLE_CLOUD_PROJECT=$APP_PROJECT
 ```
+
+After the app is deployed, navigate to the Service URL. The site should resemble the following
+
+img src="./images/warranty-portal-ui.png" width="400">
