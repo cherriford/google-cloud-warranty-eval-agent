@@ -167,3 +167,28 @@ echo "PASTE_DATA_HERE" | base64 --decode
 You should see the original JSON payload:
 
 <img src="./images/decoded-message.png" width="900">
+
+# Deploy Agent 1
+
+Agent 1 is our case manager. The purpose of this agent is to receive the claims, make A2A calls to our other two agents, and write interaction summaries to a Storage or BigQuery table. 
+
+## 1. Secure Artifact Infrastructure
+
+Before deploying the agent, we need to establish the private zone where Agent 1's artifacts will live and be scanned.
+
+```bash
+# 1. Create the Secure Repository
+gcloud artifacts repositories create agent-registry \
+    --project=$IMAGE_PROJECT \
+    --repository-format=docker \
+    --location=$REGION \
+    --description="Secure vault for AI Agent images and manifests"
+
+# 2. Enable Automatic Vulnerability Scanning
+gcloud services enable containerscanning.googleapis.com --project=$IMAGE_PROJECT
+```
+
+## 2. Define Logic for Agent 1
+
+Agent 1 acts as a Reasoning Engine. In Vertex AI, this is typically implemented using a Python-based framework that defines how the agent thinks and which tools it calls.
+
