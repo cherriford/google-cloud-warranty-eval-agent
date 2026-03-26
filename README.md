@@ -124,3 +124,39 @@ gcloud run deploy warranty-portal \
 After the app is deployed, navigate to the Service URL. The site should resemble the following
 
 <img src="./images/warranty-portal-ui.png" width="400">
+
+# Test Claim Submission
+
+The application will not publish any of the claims yet. First, we need to create a subscription.
+
+## 1. Create a Pull Subscription
+
+Run this command to create a receiver for your messages in the App Project.
+
+```bash
+gcloud pubsub subscriptions create warranty-claims-sub \
+    --topic=$TOPIC_NAME \
+    --project=$APP_PROJECT
+```
+
+## 2. Submit a Test Claim
+
+1. Open your Cloud Run URL in your browser
+1. Fill out the form with these details:
+    - Customer ID: C-552
+    - Serial Number: SN-99812
+    - Issue: The battery no longer holds a charge.
+1. Click Submit Claim. You should see a success message on the site.
+
+## 3. Pull the Message from the Terminal
+
+Now, let's see if the message actually made it to the subscription. We'll pull the message and look at the data.
+
+```bash
+gcloud pubsub subscriptions pull warranty-claims-sub \
+    --project=$APP_PROJECT \
+    --auto-ack \
+    --format="json"
+```
+
+You should see a JSON output containing the `data` field. The data is base64 encoded by default, but the gcloud command usually decodes it in the output. It should resemble the following: `{"event": "claim_submitted", "customer_id": "C-552", ...}`
