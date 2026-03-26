@@ -2,10 +2,6 @@
 
 Event-driven, multi-agent system built on Google Cloud for Agentic Security, Safety, and Trust Whitepaper. It automates the warranty claim lifecycle by transforming raw user submissions into verified entitlement actions. Using a Zero-Trust Case Manager orchestrator, the system securely coordinates between specialized agents (entitlement & logistics) to verify purchase history and generate resolution outcomes—all without exposing sensitive customer PII to the public-facing entry point.
 
-## Overview
-
-This project implements an agentic chain triggered by customer events. It is designed with a **zero-trust** security model in mind, ensuring that the public-facing orchestrator has minimal permissions.
-
 ## Prerequisites
 
 Before beginning the deployment, ensure the following requirements are met:
