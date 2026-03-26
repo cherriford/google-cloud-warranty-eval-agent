@@ -61,7 +61,7 @@ export APP_PROJECT_NUMBER=$(gcloud projects describe $APP_PROJECT --format="valu
 
 ## 2. Build and Push the Container Image
 
-Build the container from your local source code and push it to the central Image Project. Run this from the directory containing the Dockerfile and app.py from the customer-portal directory in this repo.
+Navigate to (or clone) the customer-portal/ directory in this repo. This contains the `Dockerfile`, `app.py`, and `requirements.txt`. Run the following command to package your source code and push the image to the central Image Project.
 
 ```bash
 gcloud builds submit \
