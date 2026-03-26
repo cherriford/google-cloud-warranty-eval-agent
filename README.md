@@ -50,6 +50,9 @@ export REPO_NAME="warranty-portal-repo"
 export IMAGE_NAME="portal-app:v1"
 export TOPIC_NAME="warranty-claims"
 export SA_NAME="portal-identity"
+export AGENT_REPO_NAME="agent-registry"
+export BUCKET_NAME="agent-1-vault-${APP_PROJECT}"
+
 
 # Dynamically fetch the App Project Number for IAM bindings
 export APP_PROJECT_NUMBER=$(gcloud projects describe $APP_PROJECT --format="value(projectNumber)")
