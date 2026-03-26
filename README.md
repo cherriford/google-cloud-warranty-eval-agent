@@ -19,6 +19,7 @@ For the Image Project:
 gcloud services enable \
     cloudbuild.googleapis.com \
     artifactregistry.googleapis.com \
+    containerscanning.googleapis.com \
     --project="IMAGE_PROJECT_ID"
 ```
 
@@ -30,6 +31,8 @@ gcloud services enable \
     run.googleapis.com \
     pubsub.googleapis.com \
     iam.googleapis.com \
+    binaryauthorization.googleapis.com \
+    storage.googleapis.com \
     --project="APP_PROJECT_ID"
 ```
 
