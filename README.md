@@ -352,10 +352,75 @@ Install the final dependencies:
 pip install pydantic cloudpickle
 ```
 
-Then run the deployment. This will take a few minutes to deploy:
+Then run the deployment. This may take around 5-10 minutes to deploy:
 
 ```bash
 python3 deploy.py
 ```
 
+## 7. Test the Agent
+
+For this, we'll write a quick Python script to act like the Customer Portal and send a mock claim directly to agent 1.
+
+```bash
+cat << 'EOF' > test.py
+import os
+import vertexai
+
+PROJECT = os.environ.get("APP_PROJECT")
+AGENT_ID = os.environ.get("ENGINE_ID") 
+
+# Initialize Vertex AI using the specific v1beta1 Client
+client = vertexai.Client(
+    project=PROJECT, 
+    location="us-central1",
+    http_options=dict(api_version="v1beta1")
+)
+
+print("Connecting to Case Manager Agent...")
+# For ADK, we use client.agent_engines.get() instead of ReasoningEngine()
+remote_agent = client.agent_engines.get(
+    name=f"projects/{PROJECT}/locations/us-central1/reasoningEngines/{AGENT_ID}"
+)
+
+mock_claim = """
+New Claim Event:
+- Customer ID: C-552
+- Serial Number: SN-99812
+- Issue Description: The battery no longer holds a charge.
+"""
+
+print("Sending mock claim...")
+
+# ADK requires a user_id and uses stream_query
+events = remote_agent.stream_query(
+    user_id="test_user_001",
+    message=mock_claim
+)
+
+print("\n=== Agent 1 Output ===")
+# Since it's a stream, we iterate through the chunks
+for event in events:
+    # ADK returns dictionaries; we just want to print the generated text
+    if "text" in event:
+        print(event["text"], end="")
+    else:
+        print(event, end="")
+print("\n======================\n")
+EOF
+```
+
+Run the test:
+
+```bash
+python3 test.py
+```
+
+The agent should output a response acknowledging the battery issue, stating that it needs to check the warranty status and call agent 2. For example:
+
+```
+{'model_version': 'gemini-2.5-flash', 'content': {'parts': [{'text': 'Okay, I understand.\n\n**1. Categorize the failure:**\nThe issue description "The battery no longer holds a charge" indicates a **Battery Failure / Power Issue**.\n\n**2. Warranty Check Requirement:**\nBefore proceeding with any repair or replacement options, I need to verify if the product (SN-99812) is still under warranty.\n\n**3. Action:**\nI cannot access warranty information directly. I need to consult another agent.\n\nCalling **Agent 2 (Warranty_Verification_Agent)** to check the warranty status for **Serial Number: SN-99812**.'}], 'role': 'model'}...
+```
+
+# Deploy Pub/Sub Dispatcher
 
