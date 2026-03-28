@@ -38,6 +38,10 @@ gcloud services enable \
     clouderrorreporting.googleapis.com \
     cloudtrace.googleapis.com \
     cloudresourcemanager.googleapis.com \
+    modelarmor.googleapis.com \
+    cloudfunctions.googleapis.com \
+    cloudbuild.googleapis.com \
+    eventarc.googleapis.com \
     --project="APP_PROJECT_ID"
 ```
 
@@ -423,4 +427,212 @@ The agent should output a response acknowledging the battery issue, stating that
 ```
 
 # Deploy Pub/Sub Dispatcher
+
+## 1. Create a Dedicated Service Account
+
+Instead of using the default compute service account, we will create a custom, least-privilege service account specifically for this Dispatcher.
+
+```bash
+# 1. Set your variables
+export SA_NAME="dispatcher-sa"
+export SA_EMAIL="${SA_NAME}@${APP_PROJECT}.iam.gserviceaccount.com"
+
+# 2. Create the dedicated Service Account
+gcloud iam service-accounts create $SA_NAME \
+    --description="Least-privilege SA for the Pub/Sub Dispatcher" \
+    --display-name="Dispatcher Service Account" \
+    --project=$APP_PROJECT
+```
+
+## 2. Create the Model Armor Template
+
+The Dispatcher will send all content to Model Armor to scan against prompt injections, malicious URLs, and toxic content.
+
+```bash
+gcloud model-armor templates create claim-sanitizer \
+    --project=$APP_PROJECT \
+    --location=us \
+    --basic-config-filter-enforcement=enabled \
+    --pi-and-jailbreak-filter-settings-enforcement=enabled \
+    --pi-and-jailbreak-filter-settings-confidence-level=HIGH \
+    --malicious-uri-filter-settings-enforcement=enabled \
+    --rai-settings-filters='[{"filterType":"HATE_SPEECH","confidenceLevel":"MEDIUM_AND_ABOVE"},{"filterType":"DANGEROUS","confidenceLevel":"MEDIUM_AND_ABOVE"}]' \
+    --template-metadata-log-operations \
+    --template-metadata-log-sanitize-operations
+```
+
+NOTE: Revisit for SDP de-identify options.
+
+## 3. Write the Dispatcher Code
+
+Create the files included in the /dispatcher directory: `requirements.txt` and `main.py`:
+
+```bash
+mkdir ~/secure-dispatcher
+cd ~/secure-dispatcher
+
+# Create dependencies file
+cat << 'EOF' > requirements.txt
+functions-framework>=3.8.0
+google-cloud-aiplatform[adk,agent_engines]>=1.50.0
+google-cloud-modelarmor>=0.4.0
+EOF
+```
+
+Run this to create `main.py`:
+
+```bash
+import base64
+import json
+import os
+import vertexai
+from google.cloud import modelarmor_v1
+import functions_framework
+
+PROJECT = os.environ.get("APP_PROJECT")
+LOCATION = "us-central1"
+AGENT_ID = os.environ.get("ENGINE_ID") 
+
+vertexai.init(project=PROJECT, location=LOCATION)
+client = vertexai.Client(http_options=dict(api_version="v1beta1"))
+
+# FIX: Explicitly route the client to the 'us' multi-region endpoint
+ma_client = modelarmor_v1.ModelArmorClient(
+    client_options={"api_endpoint": "modelarmor.us.rep.googleapis.com"}
+)
+
+@functions_framework.cloud_event
+def process_claim(cloud_event):
+    msg_data = base64.b64decode(cloud_event.data["message"]["data"]).decode("utf-8")
+    
+    try:
+        claim_data = json.loads(msg_data)
+        formatted_claim = f"""
+        New Claim Event:
+        - Customer ID: {claim_data.get("customer_id", "Unknown")}
+        - Serial Number: {claim_data.get("serial_number", "Unknown")}
+        - Issue Description: {claim_data.get("issue_description", "No description")}
+        """
+        claim_id = claim_data.get("claim_id", "default_001")
+    except json.JSONDecodeError:
+        formatted_claim = f"New Claim Event:\n{msg_data}"
+        claim_id = "fallback_001"
+
+    print(f"Sending claim {claim_id} to Model Armor...")
+    
+    # Back to the standard, correct Project ID format!
+    template_name = f"projects/{PROJECT}/locations/us/templates/claim-sanitizer"
+    
+    request = modelarmor_v1.SanitizeUserPromptRequest(
+        name=template_name,
+        user_prompt_data=modelarmor_v1.DataItem(text=formatted_claim)
+    )
+    
+    ma_response = ma_client.sanitize_user_prompt(request=request)
+    
+    if ma_response.sanitization_result.filter_match_state.name == "MATCH_FOUND":
+        print(f"SECURITY ALERT: Malicious input detected. Dropping claim {claim_id}.")
+        return "Blocked by Model Armor", 400
+
+    print("Security check passed. Forwarding to Agent 1...")
+    
+    remote_agent = client.agent_engines.get(
+        name=f"projects/{PROJECT}/locations/{LOCATION}/reasoningEngines/{AGENT_ID}"
+    )
+
+    events = remote_agent.stream_query(
+        user_id=f"user_{claim_id}",
+        message=formatted_claim
+    )
+
+    print("\n=== Agent 1 Output ===")
+    for event in events:
+        if "text" in event:
+            print(event["text"], end="")
+    print("\n======================\n")
+    
+    return "Success", 200
+```    
+    
+## 4. Deploy the Cloud Function
+
+Before the function can run, Google Cloud uses Cloud Build to package the Python code into a container. By default, Cloud Build uses the default compute service account to do this lifting, and it needs permission to build that container.
+
+```bash
+export PROJECT_NUMBER=$(gcloud projects describe $APP_PROJECT --format="value(projectNumber)")
+export COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+export PUBSUB_SA="service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com"
+
+gcloud projects add-iam-policy-binding $APP_PROJECT \
+  --member="serviceAccount:${COMPUTE_SA}" \
+  --role="roles/cloudbuild.builds.builder"
+
+gcloud projects add-iam-policy-binding $APP_PROJECT \
+    --member="serviceAccount:${PUBSUB_SA}" \
+    --role="roles/iam.serviceAccountTokenCreator"  
+```  
+
+We also need to grant Eventarc permissions to push to Cloud Functions:
+
+```
+# 1. Invoker permission so Pub/Sub can knock on the door
+gcloud run services add-iam-policy-binding pubsub-dispatcher \
+    --region=us-central1 \
+    --member="serviceAccount:${COMPUTE_SA}" \
+    --role="roles/run.invoker" \
+    --project=$APP_PROJECT
+```
+
+This deployment command attaches the dedicated Service Account to the function and restricts network access via the --ingress-settings flag.
+
+```bash
+gcloud functions deploy pubsub-dispatcher \
+    --gen2 \
+    --runtime=python311 \
+    --memory=1024MiB \
+    --region=us-central1 \
+    --source=. \
+    --entry-point=process_claim \
+    --trigger-topic=warranty-claims \
+    --service-account=$SA_EMAIL \
+    --ingress-settings=internal-only \
+    --set-env-vars=APP_PROJECT=$APP_PROJECT \
+    --project=$APP_PROJECT
+```
+
+## 5. Dispatcher Permissions
+
+Grant the Dispatcher Service Account the permissions it needs to call Model Armor and Agent Engine
+
+```bash
+# 1. Allow the Dispatcher to use Model Armor
+gcloud projects add-iam-policy-binding $APP_PROJECT \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/modelarmor.user"
+
+# 2. Allow the Dispatcher to call Vertex AI Agents
+gcloud projects add-iam-policy-binding $APP_PROJECT \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/aiplatform.user"
+```
+
+## 6. Test Dispatcher
+
+Send a claim into the Pub/Sub topic (either through the customer portal UI or directly):
+
+```bash
+gcloud pubsub topics publish warranty-claims \
+    --project=$APP_PROJECT \
+    --message='{"claim_id": "CLM-9921", "customer_id": "C-881", "serial_number": "SN-4451X", "issue_description": "The device screen is cracked and unresponsive."}'
+```
+
+Because Cloud Functions process messages almost instantly, you can jump straight to the logs to see your Model Armor and Agent Engine outputs. Run this command to read the latest logs:
+
+```bash
+gcloud functions logs read pubsub-dispatcher \
+    --project=$APP_PROJECT \
+    --region=us-central1 \
+    --gen2 \
+    --limit=30
+```
 
