@@ -60,7 +60,7 @@ export TOPIC_NAME="warranty-claims"
 export SA_NAME="portal-identity"
 export AGENT_REPO_NAME="agent-registry"
 export BUCKET_NAME="agent-1-vault-${APP_PROJECT}"
-
+export STAGING_BUCKET="agent-1-staging-${APP_PROJECT}"
 
 # Dynamically fetch the App Project Number for IAM bindings
 export APP_PROJECT_NUMBER=$(gcloud projects describe $APP_PROJECT --format="value(projectNumber)")
@@ -195,19 +195,167 @@ gcloud artifacts repositories create agent-registry \
     --location=$REGION \
     --description="Secure vault for AI Agent images and manifests"
 
-# 2. Enable Automatic Vulnerability Scanning
-gcloud services enable containerscanning.googleapis.com --project=$IMAGE_PROJECT
-
-# 3. Create the Staging Bucket
-gcloud storage buckets create gs://$BUCKET_NAME --project=$APP_PROJECT --location=$REGION
+# 2 Create the Staging Bucket
+gcloud storage buckets create gs://$STAGING_BUCKET --project=$APP_PROJECT --location=$REGION
 ```
 
-## 2. Provision the Agent Identity
+## 2. Initialize Environment
+
+I'm using a venv to run Python, but you don't have to:
+
+```bash
+# 1. Create and activate a fresh virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 2. Install the ADK
+pip install --upgrade google-cloud-aiplatform[adk,agent_engines]
+```
+
+## 3. Provision the Agent Identity
 
 In order to set up IAM policies before deploying our agent, we need to create an agent identity without deploying agent code. To do so, we create an Agent Engine instance with just the `identity_type` field per [our documentation](https://docs.cloud.google.com/agent-builder/agent-engine/agent-identity#create-agent-identity). 
 
+Run the following command to automatically create the `provisioning.py` file from the /agent-1 directory:
 
+```bash
+cat << 'EOF' > provision.py
+import vertexai
+from vertexai import types
+import os
 
+PROJECT = os.environ.get("APP_PROJECT")
 
-Agent 1 acts as a Reasoning Engine. In Vertex AI, this is typically implemented using a Python-based framework that defines how the agent thinks and which tools it calls.
+# Initialize client using v1beta1 for Agent Identity support
+client = vertexai.Client(
+    project=PROJECT, 
+    location="us-central1", 
+    http_options=dict(api_version="v1beta1")
+)
+
+# Create an empty instance
+remote_app = client.agent_engines.create(
+    config={"identity_type": types.IdentityType.AGENT_IDENTITY}
+)
+
+print("\n--- SAVE THESE VALUES ---")
+print(f"AGENT_ENGINE_ID: {remote_app.api_resource.name.split('/')[-1]}")
+print(f"PRINCIPAL_ID: {remote_app.api_resource.spec.effective_identity}")
+print("-------------------------\n")
+EOF
+```
+
+Run the script you just created. This will take a few minutes to deploy:
+
+```bash
+python3 provision.py
+```
+
+Now, copy the AGENT_ENGINE_ID and the PRINCIPAL_ID values and save them as environment variables
+
+```bash
+export AGENT_PRINCIPAL="principal://PASTE_YOUR_PRINCIPAL_ID_HERE"
+export ENGINE_ID="PASTE_YOUR_AGENT_ENGINE_ID_HERE"
+```
+
+## 4. Grant IAM Access
+
+Now that we have the Principal ID, we can apply IAM boundaries. These commands grant the agent exactly what it needs and nothing more.
+
+```bash
+# Grant standard Agent Engine operational roles
+for ROLE in "roles/aiplatform.expressUser" "roles/serviceusage.serviceUsageConsumer" "roles/browser"; do
+  gcloud projects add-iam-policy-binding $APP_PROJECT \
+    --member="$AGENT_PRINCIPAL" --role="$ROLE"
+done
+
+# Grant read-only access to the Pub/Sub claims topic
+gcloud pubsub topics add-iam-policy-binding warranty-claims \
+    --project=$APP_PROJECT \
+    --member="$AGENT_PRINCIPAL" \
+    --role="roles/pubsub.viewer"
+
+# Grant write access to your staging bucket
+gcloud storage buckets add-iam-policy-binding gs://$STAGING_BUCKET \
+    --project=$APP_PROJECT \
+    --member="$AGENT_PRINCIPAL" \
+    --role="roles/storage.objectUser"
+```
+
+## 5. Create the Agent Logic and Deployment Scripts
+
+Next, create the files that contain the agent's logic and the deployment mechanism. 
+
+Run this to create `agent_logic.py` file from the /agent-1 directory:
+
+```bash
+cat << 'EOF' > agent_logic.py
+from google.adk.agents import Agent
+
+agent = Agent(
+    model="gemini-2.5-flash",
+    name="Case_Manager_Agent_1",
+    instruction="""You are the Diagnostic Orchestrator. 
+    1. Categorize the failure from the issue_description.
+    2. Realize you need to check if the product is under warranty.
+    3. You have NO access to customer PII or financial data.
+    4. Call Agent 2 for warranty verification and Agent 3 for logistics."""
+)
+EOF
+```
+
+Run this to create `deploy.py` file from the /agent-1 directory:
+
+```bash
+cat << 'EOF' > deploy.py
+import vertexai
+from vertexai.agent_engines import AdkApp
+from agent_logic import agent
+import os
+
+PROJECT = os.environ.get("APP_PROJECT")
+BUCKET = os.environ.get("STAGING_BUCKET")
+AGENT_ID = os.environ.get("ENGINE_ID") 
+
+client = vertexai.Client(
+    project=PROJECT, 
+    location="us-central1", 
+    http_options=dict(api_version="v1beta1")
+)
+
+app = AdkApp(agent=agent)
+
+# Update the empty instance with your code
+remote_app = client.agent_engines.update(
+    name=f"projects/{PROJECT}/locations/us-central1/reasoningEngines/{AGENT_ID}",
+    agent=app,
+    config={
+        "display_name": "Case_Manager_Agent_1",
+        "identity_type": vertexai.types.IdentityType.AGENT_IDENTITY,
+        "requirements": [
+            "google-cloud-aiplatform[adk,agent_engines]", 
+            "pydantic", 
+            "cloudpickle"
+        ],
+        "staging_bucket": f"gs://{BUCKET}",
+    }
+)
+print("Agent 1 successfully deployed and secured!")
+EOF
+```
+
+## 6. Deploy the Agent
+
+Install the final dependencies:
+
+```bash
+pip install pydantic cloudpickle
+```
+
+Then run the deployment. This will take a few minutes to deploy:
+
+```bash
+python3 deploy.py
+```
+
 
