@@ -300,9 +300,9 @@ agent = Agent(
     model="gemini-2.5-flash",
     name="Case_Manager_Agent_1",
     instruction="""You are the Diagnostic Orchestrator. 
-    1. Categorize the failure from the issue_description.
-    2. Realize you need to check if the product is under warranty.
-    3. You have NO access to customer PII or financial data.
+    1. Categorize the failure from the issue_description. 
+    2. Realize you need to check if the product is under warranty. 
+    3. You have NO access to customer PII or financial data. 
     4. Call Agent 2 for warranty verification and Agent 3 for logistics."""
 )
 EOF
@@ -313,7 +313,6 @@ Run this to create `deploy.py` file from the /agent-1 directory:
 ```bash
 cat << 'EOF' > deploy.py
 import vertexai
-from vertexai.agent_engines import AdkApp
 from agent_logic import agent
 import os
 
@@ -327,12 +326,12 @@ client = vertexai.Client(
     http_options=dict(api_version="v1beta1")
 )
 
-app = AdkApp(agent=agent)
+print("Deploying Native ADK Agent...")
 
-# Update the empty instance with your code
+# Update the instance directly with your ADK 'agent' variable
 remote_app = client.agent_engines.update(
     name=f"projects/{PROJECT}/locations/us-central1/reasoningEngines/{AGENT_ID}",
-    agent=app,
+    agent=agent,
     config={
         "display_name": "Case_Manager_Agent_1",
         "identity_type": vertexai.types.IdentityType.AGENT_IDENTITY,
@@ -344,7 +343,7 @@ remote_app = client.agent_engines.update(
         "staging_bucket": f"gs://{BUCKET}",
     }
 )
-print("Agent 1 successfully deployed and secured!")
+print("ADK Agent successfully deployed and secured!")
 EOF
 ```
 
@@ -482,21 +481,21 @@ EOF
 Run this to create `main.py`:
 
 ```bash
+cat << 'EOF' > main.py
 import base64
 import json
 import os
-import vertexai
 from google.cloud import modelarmor_v1
+from google.cloud import aiplatform_v1beta1
 import functions_framework
 
 PROJECT = os.environ.get("APP_PROJECT")
+PROJECT_NUMBER = os.environ.get("PROJECT_NUMBER")
 LOCATION = "us-central1"
-AGENT_ID = os.environ.get("ENGINE_ID") 
+AGENT_ID = os.environ.get("ENGINE_ID")
 
-vertexai.init(project=PROJECT, location=LOCATION)
-client = vertexai.Client(http_options=dict(api_version="v1beta1"))
+exec_client = aiplatform_v1beta1.ReasoningEngineExecutionServiceClient()
 
-# FIX: Explicitly route the client to the 'us' multi-region endpoint
 ma_client = modelarmor_v1.ModelArmorClient(
     client_options={"api_endpoint": "modelarmor.us.rep.googleapis.com"}
 )
@@ -520,7 +519,6 @@ def process_claim(cloud_event):
 
     print(f"Sending claim {claim_id} to Model Armor...")
     
-    # Back to the standard, correct Project ID format!
     template_name = f"projects/{PROJECT}/locations/us/templates/claim-sanitizer"
     
     request = modelarmor_v1.SanitizeUserPromptRequest(
@@ -534,24 +532,48 @@ def process_claim(cloud_event):
         print(f"SECURITY ALERT: Malicious input detected. Dropping claim {claim_id}.")
         return "Blocked by Model Armor", 400
 
-    print("Security check passed. Forwarding to Agent 1...")
+    print("Security check passed. Forwarding to ADK Agent 1...")
     
-    remote_agent = client.agent_engines.get(
-        name=f"projects/{PROJECT}/locations/{LOCATION}/reasoningEngines/{AGENT_ID}"
+    engine_name = f"projects/{PROJECT_NUMBER}/locations/{LOCATION}/reasoningEngines/{AGENT_ID}"
+    
+    exec_request = aiplatform_v1beta1.StreamQueryReasoningEngineRequest(
+        name=engine_name,
+        class_method="stream_query",  
+        input={
+            "message": formatted_claim,
+            "user_id": claim_id  
+        }
     )
-
-    events = remote_agent.stream_query(
-        user_id=f"user_{claim_id}",
-        message=formatted_claim
-    )
+    
+    response_stream = exec_client.stream_query_reasoning_engine(request=exec_request)
 
     print("\n=== Agent 1 Output ===")
-    for event in events:
-        if "text" in event:
-            print(event["text"], end="")
-    print("\n======================\n")
+    for chunk in response_stream:
+        if hasattr(chunk, 'data'):
+            try:
+                # 1. Decode bytes to string
+                raw_str = chunk.data.decode("utf-8")
+                
+                # 2. Parse the ADK JSON payload
+                payload = json.loads(raw_str)
+                
+                # 3. Safely drill down to the "text" key
+                parts = payload.get("content", {}).get("parts", [])
+                for part in parts:
+                    text_val = part.get("text")
+                    if text_val:
+                        # Print the text cleanly to Cloud Logging
+                        print(text_val, end="", flush=True)
+                        
+            except json.JSONDecodeError:
+                # If it isn't JSON for some reason, ignore it so it doesn't crash the loop
+                pass
+                
+    # Print a final newline to ensure Cloud Logging registers the completed block
+    print("\n======================\n", flush=True)
     
     return "Success", 200
+EOF    
 ```    
     
 ## 4. Deploy the Cloud Function
@@ -586,18 +608,20 @@ gcloud run services add-iam-policy-binding pubsub-dispatcher \
 This deployment command attaches the dedicated Service Account to the function and restricts network access via the --ingress-settings flag.
 
 ```bash
-gcloud functions deploy pubsub-dispatcher \
-    --gen2 \
-    --runtime=python311 \
-    --memory=1024MiB \
-    --region=us-central1 \
-    --source=. \
-    --entry-point=process_claim \
-    --trigger-topic=warranty-claims \
-    --service-account=$SA_EMAIL \
-    --ingress-settings=internal-only \
-    --set-env-vars=APP_PROJECT=$APP_PROJECT \
-    --project=$APP_PROJECT
+export APP_PROJECT=$(gcloud config get-value project)
+export PROJECT_NUMBER=$(gcloud projects describe $APP_PROJECT --format="value(projectNumber)")
+export SA_EMAIL="dispatcher-sa@${APP_PROJECT}.iam.gserviceaccount.com"
+
+
+gcloud run deploy pubsub-dispatcher \
+    --source . \
+    --function process_claim \
+    --region us-central1 \
+    --memory 1024Mi \
+    --service-account $SA_EMAIL \
+    --no-allow-unauthenticated \
+    --set-env-vars="APP_PROJECT=${APP_PROJECT},PROJECT_NUMBER=${PROJECT_NUMBER},ENGINE_ID=${ENGINE_ID}" \
+    --project $APP_PROJECT
 ```
 
 ## 5. Dispatcher Permissions
