@@ -762,10 +762,45 @@ Create `deploy_agent2.py`:
 
 ```bash
 cat << 'EOF' > deploy_agent2.py
+import json
 import vertexai
-from agent2_logic import agent2
 import os
+from google.adk.agents import Agent
 
+# ==========================================
+# 1. THE ENTITLEMENT GUARDIAN LOGIC
+# ==========================================
+def check_warranty_status(serial_number: str) -> str:
+    """Queries the secure database for warranty entitlement."""
+    mock_db = {
+        "SN-DEF": {"status": "Covered", "expiration_date": "2027-10-12", "deductible_required": False, "_hidden_cc": "4111-1111-1111-1111", "_home_address": "123 Main St"},
+        "SN-XYZ": {"status": "Expired", "expiration_date": "2024-01-01", "deductible_required": True, "_hidden_cc": "5555-5555-5555-5555", "_home_address": "456 Oak Ave"},
+        "SN-ALPHA": {"status": "Covered", "expiration_date": "2028-05-20", "deductible_required": False, "_hidden_cc": "4242-4242-4242-4242", "_home_address": "789 Pine Rd"}
+    }
+
+    record = mock_db.get(serial_number, {"status": "Unknown", "expiration_date": "N/A", "deductible_required": False})
+
+    # The Zero-Trust Primitive
+    safe_response = {
+        "status": record.get("status"),
+        "expiration_date": record.get("expiration_date"),
+        "deductible_required": record.get("deductible_required")
+    }
+    return json.dumps(safe_response)
+
+agent2 = Agent(
+    model="gemini-2.5-flash",
+    name="Agent_Warranty_Agent_2",
+    instruction="""You are the Entitlement Guardian.
+    You operate in a High-Trust Financial Silo. Your ONLY job is to take a serial_number, use your `check_warranty_status` tool to query the secure database, and return the exact JSON result.
+    
+    CRITICAL SECURITY PRIMITIVE: You must NEVER output, request, or handle customer names, addresses, credit card numbers, or purchase prices. Output ONLY the safe warranty status JSON.""",
+    tools=[check_warranty_status]
+)
+
+# ==========================================
+# 2. THE DEPLOYMENT EXECUTION
+# ==========================================
 PROJECT = os.environ.get("APP_PROJECT")
 BUCKET = os.environ.get("STAGING_BUCKET")
 
@@ -777,7 +812,6 @@ client = vertexai.Client(
 
 print("Deploying Agent 2: The Entitlement Guardian...")
 
-# Use .create() to spin up a completely new Agent Engine instance
 remote_app = client.agent_engines.create(
     agent=agent2,
     config={
@@ -815,4 +849,181 @@ python3 -m pip install --upgrade google-genai google-cloud-aiplatform
 python3 deploy_agent2.py
 ```
 
+Then save the value for the Engine ID of our Agent 2: Self reference: 792370201382354944
 
+## 5. Allow Agent 1 to call Agent 2
+
+Open your original agent_logic.py (the one for Agent 1). We are going to add a Python function that uses the exact same secure gRPC streaming client we built for Cloud Run, but this time, it's running inside Agent 1 to talk to Agent 2.
+
+Overwrite `agent_logic.py`:
+
+```bash
+cat << 'EOF' > agent_logic.py
+import os
+import json
+from google.adk.agents import Agent
+
+def call_entitlement_guardian(serial_number: str) -> str:
+    """
+    A2A Client: Calls Agent 2 (The Entitlement Guardian) to securely verify warranty status.
+    Agent 1 has NO access to PII; it only receives the safe JSON response from Agent 2.
+    """
+    from google.cloud import aiplatform_v1beta1
+    
+    # We dynamically grab the project number from the container's environment
+    PROJECT_NUMBER = os.environ.get("PROJECT_NUMBER")
+    AGENT_2_ID = "792370201382354944" # Your newly deployed Agent 2 ID!
+    
+    client = aiplatform_v1beta1.ReasoningEngineExecutionServiceClient()
+    engine_name = f"projects/{PROJECT_NUMBER}/locations/us-central1/reasoningEngines/{AGENT_2_ID}"
+    
+    # We use the exact same streaming protocol we perfected earlier
+    request = aiplatform_v1beta1.StreamQueryReasoningEngineRequest(
+        name=engine_name,
+        class_method="stream_query",
+        input={
+            "message": serial_number,
+            "user_id": f"a2a-internal-{serial_number}"
+        }
+    )
+    
+    response_stream = client.stream_query_reasoning_engine(request=request)
+    
+    result_text = ""
+    for chunk in response_stream:
+        if hasattr(chunk, 'data'):
+            try:
+                payload = json.loads(chunk.data.decode("utf-8"))
+                parts = payload.get("content", {}).get("parts", [])
+                for part in parts:
+                    if "text" in part:
+                        result_text += part["text"]
+            except json.JSONDecodeError:
+                pass
+                
+    return result_text
+
+# Define Agent 1 with the new A2A tool
+agent = Agent(
+    model="gemini-2.5-flash",
+    name="Case_Manager_Agent_1",
+    instruction="""You are the Diagnostic Orchestrator. 
+    1. Categorize the hardware/software failure from the issue_description. 
+    2. You MUST check if the product is under warranty. 
+    3. You have NO access to customer PII or financial data. 
+    4. Call the `call_entitlement_guardian` tool with the serial_number to get the warranty status.
+    5. Output the diagnostic category and the exact warranty status JSON returned by the Guardian.""",
+    tools=[call_entitlement_guardian]
+)
+EOF
+```
+
+Update the deploy.py for Agent 1 as well:
+
+```bash
+cat << 'EOF' > deploy.py
+import os
+import json
+import vertexai
+from google.adk.agents import Agent
+
+# ==========================================
+# 1. THE ORCHESTRATOR LOGIC (AGENT 1)
+# ==========================================
+def call_entitlement_guardian(serial_number: str) -> str:
+    """
+    A2A Client: Calls Agent 2 (The Entitlement Guardian) to securely verify warranty status.
+    Agent 1 has NO access to PII; it only receives the safe JSON response from Agent 2.
+    """
+    from google.cloud import aiplatform_v1beta1
+    
+    # We dynamically grab the project number from the container's environment
+    PROJECT_NUMBER = os.environ.get("PROJECT_NUMBER")
+    AGENT_2_ID = "792370201382354944" # Your newly deployed Agent 2 ID!
+    
+    client = aiplatform_v1beta1.ReasoningEngineExecutionServiceClient()
+    engine_name = f"projects/{PROJECT_NUMBER}/locations/us-central1/reasoningEngines/{AGENT_2_ID}"
+    
+    # Secure gRPC Streaming Protocol
+    request = aiplatform_v1beta1.StreamQueryReasoningEngineRequest(
+        name=engine_name,
+        class_method="stream_query",
+        input={
+            "message": serial_number,
+            "user_id": f"a2a-internal-{serial_number}"
+        }
+    )
+    
+    response_stream = client.stream_query_reasoning_engine(request=request)
+    
+    result_text = ""
+    for chunk in response_stream:
+        if hasattr(chunk, 'data'):
+            try:
+                payload = json.loads(chunk.data.decode("utf-8"))
+                parts = payload.get("content", {}).get("parts", [])
+                for part in parts:
+                    if "text" in part:
+                        result_text += part["text"]
+            except json.JSONDecodeError:
+                pass
+                
+    return result_text
+
+# Define Agent 1 with the new A2A tool
+agent = Agent(
+    model="gemini-2.5-flash",
+    name="Case_Manager_Agent_1",
+    instruction="""You are the Diagnostic Orchestrator. 
+    1. Categorize the hardware/software failure from the issue_description. 
+    2. You MUST check if the product is under warranty. 
+    3. You have NO access to customer PII or financial data. 
+    4. Call the `call_entitlement_guardian` tool with the serial_number to get the warranty status.
+    5. Output the diagnostic category and the exact warranty status JSON returned by the Guardian.""",
+    tools=[call_entitlement_guardian]
+)
+
+# ==========================================
+# 2. THE DEPLOYMENT EXECUTION
+# ==========================================
+PROJECT = os.environ.get("APP_PROJECT")
+PROJECT_NUMBER = str(os.environ.get("PROJECT_NUMBER")) 
+BUCKET = os.environ.get("STAGING_BUCKET")
+
+client = vertexai.Client(
+    project=PROJECT, 
+    location="us-central1", 
+    http_options=dict(api_version="v1beta1")
+)
+
+print("Deploying a FRESH Agent 1 with Python 3.12 and A2A capabilities...")
+
+# Using .create() forces a brand new Python 3.12 container
+remote_app = client.agent_engines.create(
+    agent=agent,
+    config={
+        "display_name": "Case_Manager_Agent_1",
+        "identity_type": vertexai.types.IdentityType.AGENT_IDENTITY,
+        "env_vars": {
+            "PROJECT_NUMBER": PROJECT_NUMBER
+        },
+        "requirements": [
+            "google-cloud-aiplatform[adk,agent_engines]", 
+            "pydantic", 
+            "cloudpickle"
+        ],
+        "staging_bucket": f"gs://{BUCKET}",
+    }
+)
+
+print("\n--- NEW AGENT 1 DEPLOYED! ---")
+print(f"NEW_AGENT_1_ID: {remote_app.api_resource.name.split('/')[-1]}")
+print("-------------------------------\n")
+EOF
+```
+
+Redeploy Agent 1:
+
+```bash
+python3 deploy.py
+```
