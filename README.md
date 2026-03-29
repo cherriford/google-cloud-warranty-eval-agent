@@ -653,10 +653,166 @@ gcloud pubsub topics publish warranty-claims \
 Because Cloud Functions process messages almost instantly, you can jump straight to the logs to see your Model Armor and Agent Engine outputs. Run this command to read the latest logs:
 
 ```bash
-gcloud functions logs read pubsub-dispatcher \
+gcloud run services logs read pubsub-dispatcher \
     --project=$APP_PROJECT \
     --region=us-central1 \
-    --gen2 \
     --limit=30
 ```
+
+The logs should resemble the following:
+
+```json
+2026-03-29 20:17:41 POST 200 https://pubsub-dispatcher-7hjhclnihq-uc.a.run.app/?__GCP_CloudEventsMode=CUSTOM_PUBSUB_projects%2Fprj-lab-multi-agent-b4%2Ftopics%2Fwarranty-claims
+2026-03-29 20:17:41 Sending claim CLM-9921 to Model Armor...
+2026-03-29 20:17:41 Security check passed. Forwarding to ADK Agent 1...
+2026-03-29 20:17:47 === Agent 1 Output ===
+2026-03-29 20:17:47 Okay, I've received the new claim event.
+2026-03-29 20:17:47 **1. Categorizing the Failure:**
+2026-03-29 20:17:47 Based on the description "The device screen is cracked and unresponsive," this is a **Physical Damage / Hardware Failure (Screen Damage)**.
+2026-03-29 20:17:47 **2. Warranty Check Necessity:**
+2026-03-29 20:17:47 Physical damage like a cracked screen often falls under specific warranty clauses or might be an out-of-warranty repair. Therefore, checking the warranty status is a critical next step to determine the appropriate service path.
+2026-03-29 20:17:47 **3. Data Access Acknowledgment:**
+2026-03-29 20:17:47 As Case_Manager_Agent_1, I do not have access to customer PII or financial data.
+2026-03-29 20:17:47 **4. Orchestrating Next Steps:**
+2026-03-29 20:17:47 To proceed, I need to verify the warranty status and prepare for potential logistics.
+2026-03-29 20:17:47 *   **Calling Agent 2 (Warranty Verification):**
+....
+2026-03-29 20:17:47 ======================
+```
+
+# Deploy Agent 2
+
+## 1. Create Agent Logic
+
+In a new directory, /agent-2, create the agent logic.
+
+```bash
+cat << 'EOF' > agent2_logic.py
+import json
+from google.adk.agents import Agent
+
+def check_warranty_status(serial_number: str) -> str:
+    """
+    Queries the secure BigQuery financial silo to check warranty status.
+    
+    Args:
+        serial_number: The unique serial number of the customer's device.
+    """
+    # Mock BigQuery Database
+    mock_db = {
+        "SN-DEF": {"status": "Covered", "expiration_date": "2027-10-12", "deductible_required": False, "_hidden_cc": "4111-1111-1111-1111", "_home_address": "123 Main St"},
+        "SN-XYZ": {"status": "Expired", "expiration_date": "2024-01-01", "deductible_required": True, "_hidden_cc": "5555-5555-5555-5555", "_home_address": "456 Oak Ave"},
+        "SN-ALPHA": {"status": "Covered", "expiration_date": "2028-05-20", "deductible_required": False, "_hidden_cc": "4242-4242-4242-4242", "_home_address": "789 Pine Rd"}
+    }
+
+    record = mock_db.get(serial_number, {"status": "Unknown", "expiration_date": "N/A", "deductible_required": False})
+
+    # THE SECURITY PRIMITIVE: We physically construct a new dictionary to ensure 
+    # PII NEVER leaves this Python function.
+    safe_response = {
+        "status": record.get("status"),
+        "expiration_date": record.get("expiration_date"),
+        "deductible_required": record.get("deductible_required")
+    }
+
+    return json.dumps(safe_response)
+
+# Define Agent 2
+agent2 = Agent(
+    model="gemini-2.5-flash",
+    name="Agent_Warranty_Agent_2",
+    instruction="""You are the Entitlement Guardian.
+    You operate in a High-Trust Financial Silo. Your ONLY job is to take a serial_number, use your `check_warranty_status` tool to query the secure database, and return the exact JSON result.
+    
+    CRITICAL SECURITY PRIMITIVE: You must NEVER output, request, or handle customer names, addresses, credit card numbers, or purchase prices. Output ONLY the safe warranty status JSON.""",
+    tools=[check_warranty_status]
+)
+EOF
+```
+
+## 2. Create an Agent Card
+
+When Vertex AI packages your deployment, it will see this file in the root directory and automatically mount it to the /.well-known/agent-card.json endpoint.
+
+Create a file named agent.json in the same directory:
+
+```bash
+cat << 'EOF' > agent.json
+{
+  "name": "Agent_Warranty_Agent_2",
+  "description": "The Entitlement Guardian: Secure Data Analyst operating in a High-Trust Financial Silo.",
+  "defaultInputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "check_warranty_status",
+      "name": "Check Warranty Status",
+      "description": "Queries the secure database for warranty entitlement given a device serial_number. Returns strict, safe JSON without PII.",
+      "tags": ["warranty", "entitlement", "secure", "A2A"]
+    }
+  ]
+}
+EOF
+```
+
+## 3. Create the Deployment Script
+
+We are going to use client.agent_engines.create() to spin up a brand new, isolated container just for Agent 2. By deploying the directory that contains both agent2_logic.py and agent.json, the ADK wrapper will natively expose your Agent Card.
+
+Create `deploy_agent2.py`:
+
+```bash
+cat << 'EOF' > deploy_agent2.py
+import vertexai
+from agent2_logic import agent2
+import os
+
+PROJECT = os.environ.get("APP_PROJECT")
+BUCKET = os.environ.get("STAGING_BUCKET")
+
+client = vertexai.Client(
+    project=PROJECT, 
+    location="us-central1", 
+    http_options=dict(api_version="v1beta1")
+)
+
+print("Deploying Agent 2: The Entitlement Guardian...")
+
+# Use .create() to spin up a completely new Agent Engine instance
+remote_app = client.agent_engines.create(
+    agent=agent2,
+    config={
+        "display_name": "Agent_Warranty_Agent_2",
+        "identity_type": vertexai.types.IdentityType.AGENT_IDENTITY,
+        "requirements": [
+            "google-cloud-aiplatform[adk,agent_engines]", 
+            "pydantic", 
+            "cloudpickle"
+        ],
+        "staging_bucket": f"gs://{BUCKET}",
+    }
+)
+
+print("\n--- SAVE THIS VALUE FOR A2A ---")
+print(f"AGENT_2_ENGINE_ID: {remote_app.api_resource.name.split('/')[-1]}")
+print("-------------------------------\n")
+print("Agent 2 successfully deployed and broadcasting its Agent Card!")
+EOF
+```
+
+## 4. Execute the Deployment
+
+Run the deployment script in your terminal:
+
+```bash
+export APP_PROJECT=$(gcloud config get-value project)
+export STAGING_BUCKET="agent-2-staging-${APP_PROJECT}"
+gcloud storage buckets create gs://$STAGING_BUCKET --project=$APP_PROJECT --location=us-central1 || true
+
+pip3 install --upgrade "google-cloud-aiplatform[adk,agent_engines]" google-adk google-cloud-storage
+
+python3 -m pip install --upgrade google-genai google-cloud-aiplatform
+
+python3 deploy_agent2.py
+```
+
 
